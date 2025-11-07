@@ -80,18 +80,10 @@ async function handleCallback(req, res, code) {
     });
 
     const discordUser = userResponse.data;
-    console.log('Discord user:', discordUser.username || discordUser.id);
 
     const outsetaPerson = await findOrCreateOutsetaUser(discordUser);
-    console.log('Outseta person UID:', outsetaPerson.Uid, 'Account UID:', outsetaPerson.Account?.Uid);
 
     const outsetaToken = await generateOutsetaToken(outsetaPerson.Email);
-
-    console.log('[DiscordSSO]', JSON.stringify({
-      email: outsetaPerson.Email,
-      uid: outsetaPerson.Uid,
-      accountUid: outsetaPerson.Account?.Uid || null,
-    }));
 
     return res.send(renderSuccessPage(outsetaToken));
   } catch (err) {
@@ -175,8 +167,6 @@ async function findOrCreateOutsetaUser(discordUser) {
     ],
   };
 
-  console.log('Creating Outseta account via /crm/registrations');
-
   const createResponse = await axios.post(
     `${apiBase}/crm/registrations`,
     createPayload,
@@ -188,8 +178,6 @@ async function findOrCreateOutsetaUser(discordUser) {
       timeout: 8000,
     }
   );
-
-  console.log('Account created:', createResponse.data.Uid, 'Person:', createResponse.data.PrimaryContact?.Uid);
 
   return createResponse.data.PrimaryContact;
 }
