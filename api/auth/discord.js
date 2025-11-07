@@ -7,6 +7,47 @@ const allowedOrigins = [
   'https://www.almeidaracingacademy.com',
 ];
 
+const allowedReturnUrls = [
+  'https://aware-amount-178968.framer.app/sign-in',
+  'https://almeidaracingacademy.com/sign-in',
+  'https://www.almeidaracingacademy.com/sign-in',
+];
+const DEFAULT_RETURN_URL = allowedReturnUrls[0];
+
+const redirectHostAllowlist = new Set([
+  ...allowedReturnUrls.map(getHost),
+  'aware-amount-178968.framer.app',
+  'almeidaracingacademy.com',
+  'www.almeidaracingacademy.com',
+].filter(Boolean));
+  
+function getHost(url) {
+  try {
+    return new URL(url).host;
+  } catch (err) {
+    return null;
+  }
+}
+
+function sanitizeRedirect(targetUrl, fallbackUrl) {
+  if (!targetUrl) return fallbackUrl;
+  try {
+    const parsed = new URL(targetUrl);
+    if (parsed.protocol !== 'https:') {
+      return fallbackUrl;
+    }
+    if (allowedReturnUrls.includes(parsed.toString())) {
+      return parsed.toString();
+    }
+    if (redirectHostAllowlist.has(parsed.host)) {
+      return parsed.toString();
+    }
+  } catch (err) {
+    return fallbackUrl;
+  }
+  return fallbackUrl;
+}
+
 // Rate limiting: 10 requests per minute per IP
 async function checkRateLimit(ip) {
   const key = `discord:ratelimit:${ip}`;
@@ -48,11 +89,9 @@ async function handleStart(req, res) {
     return res.status(500).send('Discord client ID not configured');
   }
 
-  const returnUrl = req.query.return_url;
-  
-  if (!returnUrl) {
-    return res.status(400).send('Missing return_url parameter');
-  }
+  const requestedReturnUrl = req.query.return_url;
+
+  const returnUrl = sanitizeRedirect(requestedReturnUrl, DEFAULT_RETURN_URL);
 
   const redirectUri = `${getBaseUrl(req)}/api/auth/discord`;
 
