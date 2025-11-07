@@ -14,6 +14,8 @@ const allowedReturnUrls = [
 ];
 const DEFAULT_RETURN_URL = allowedReturnUrls[0];
 
+const ACCOUNT_CONFLICT_MESSAGE = "This email is already registered. Please sign in using a known method, then link this provider from your account settings.";
+
 const redirectHostAllowlist = new Set([
   ...allowedReturnUrls.map(getHost),
   'aware-amount-178968.framer.app',
@@ -89,15 +91,45 @@ async function handleStart(req, res) {
     return res.status(500).send('Discord client ID not configured');
   }
 
-  const requestedReturnUrl = req.query.return_url;
+  const intent = (req.query.intent || 'login').toLowerCase();
+  if (!['login', 'link'].includes(intent)) {
+    return res.status(400).send('Invalid intent');
+  }
 
+  const requestedReturnUrl = req.query.return_url;
   const returnUrl = sanitizeRedirect(requestedReturnUrl, DEFAULT_RETURN_URL);
+
+  let linkPersonUid = null;
+  if (intent === 'link') {
+    const linkToken = req.query.link_token;
+    const requestedLinkUid = req.query.link_person_uid;
+
+    if (!linkToken || !requestedLinkUid) {
+      return res.status(400).send('Missing linking parameters');
+    }
+
+    try {
+      const profile = await verifyOutsetaAccessToken(linkToken);
+      if (profile?.Uid !== requestedLinkUid) {
+        return res.status(403).send('Invalid linking session');
+      }
+    } catch (err) {
+      console.error('Outseta token verification failed', err.message);
+      return res.status(403).send('Invalid linking session');
+    }
+
+    linkPersonUid = requestedLinkUid;
+  }
 
   const redirectUri = `${getBaseUrl(req)}/api/auth/discord`;
 
   // Store return URL in Vercel KV with 10 minute expiration
   const state = require('crypto').randomBytes(16).toString('hex');
-  await kv.set(`discord:state:${state}`, { returnUrl, createdAt: Date.now() }, { ex: 600 });
+  await kv.set(
+    `discord:state:${state}`,
+    { returnUrl, intent, linkPersonUid, createdAt: Date.now() },
+    { ex: 600 }
+  );
 
   const url =
     'https://discord.com/api/oauth2/authorize' +
@@ -122,6 +154,8 @@ async function handleCallback(req, res, code) {
     const state = req.query.state;
     const stateData = await kv.get(`discord:state:${state}`);
     const returnUrl = stateData?.returnUrl;
+    const intent = stateData?.intent || 'login';
+    const linkPersonUid = stateData?.linkPersonUid || null;
 
     if (!returnUrl) {
       console.error('State not found for Discord OAuth');
@@ -155,106 +189,52 @@ async function handleCallback(req, res, code) {
     });
 
     const discordUser = userResponse.data;
+    const discordId = discordUser.id;
+    const email = (discordUser.email || `${discordId}@discord.user`).toLowerCase();
 
-    const outsetaPerson = await findOrCreateOutsetaUser(discordUser);
+    const existingByDiscordId = await findPersonByField('DiscordId', discordId);
 
-    const outsetaToken = await generateOutsetaToken(outsetaPerson.Email);
+    if (existingByDiscordId) {
+      if (intent === 'link') {
+        if (!linkPersonUid || existingByDiscordId.Uid !== linkPersonUid) {
+          return res.send(renderRedirectWithError(returnUrl, 'account_exists', ACCOUNT_CONFLICT_MESSAGE));
+        }
+
+        return res.send(renderLinkSuccessPage(returnUrl, 'discord'));
+      }
+
+      const outsetaToken = await generateOutsetaToken(existingByDiscordId.Email);
+      return res.send(renderSuccessPage(outsetaToken, returnUrl));
+    }
+
+    if (intent === 'link') {
+      if (!linkPersonUid) {
+        return res.send(renderErrorPage('Linking session expired.'));
+      }
+
+      const person = await getPersonByUid(linkPersonUid);
+      if (!person) {
+        return res.send(renderErrorPage('Unable to locate your account.'));
+      }
+
+      await updatePerson(linkPersonUid, buildDiscordUpdatePayload(person, discordUser));
+
+      return res.send(renderLinkSuccessPage(returnUrl, 'discord'));
+    }
+
+    const existingByEmail = await findPersonByEmail(email);
+    if (existingByEmail) {
+      return res.send(renderRedirectWithError(returnUrl, 'account_exists', ACCOUNT_CONFLICT_MESSAGE));
+    }
+
+    const createdPerson = await createDiscordOutsetaUser(discordUser);
+    const outsetaToken = await generateOutsetaToken(createdPerson.Email);
 
     return res.send(renderSuccessPage(outsetaToken, returnUrl));
   } catch (err) {
     dumpError('[DiscordSSO]', err);
     return res.send(renderErrorPage('Unable to complete Discord sign in.'));
   }
-}
-
-async function findOrCreateOutsetaUser(discordUser) {
-  const apiBase = `https://${process.env.OUTSETA_DOMAIN}/api/v1`;
-  const authHeader = { Authorization: `Outseta ${process.env.OUTSETA_API_KEY}:${process.env.OUTSETA_SECRET_KEY}` };
-
-  const email = discordUser.email || `${discordUser.id}@discord.user`;
-  const displayName = discordUser.global_name || discordUser.username || 'Discord User';
-  const desiredDiscord = {
-    DiscordUsername: discordUser.username || '',
-    DiscordUserId: discordUser.id,
-    DiscordEmail: discordUser.email || '',
-  };
-
-  // Try to find existing person
-  try {
-    const search = await axios.get(`${apiBase}/crm/people`, {
-      headers: authHeader,
-      params: { Email: email },
-      timeout: 8000,
-    });
-
-    if (search.data.items && search.data.items.length > 0) {
-      const person = search.data.items[0];
-      const current = person.DiscordUser || {};
-      const needsUpdate =
-        current.DiscordUsername !== desiredDiscord.DiscordUsername ||
-        current.DiscordUserId !== desiredDiscord.DiscordUserId ||
-        current.DiscordEmail !== desiredDiscord.DiscordEmail;
-
-      if (needsUpdate) {
-        await axios.put(
-          `${apiBase}/crm/people/${person.Uid}`,
-          {
-            Uid: person.Uid,
-            Email: person.Email,
-            FirstName: person.FirstName,
-            LastName: person.LastName,
-            DiscordUser: desiredDiscord,
-          },
-          {
-            headers: { ...authHeader, 'Content-Type': 'application/json' },
-            timeout: 8000,
-          }
-        );
-      }
-
-      return person;
-    }
-  } catch (err) {
-    console.warn('Outseta search failed, will try to create:', err.message);
-  }
-
-  // Use /crm/registrations endpoint with free subscription
-  const createPayload = {
-    Name: displayName,
-    PersonAccount: [
-      {
-        IsPrimary: true,
-        Person: {
-          Email: email,
-          FirstName: displayName,
-          LastName: 'User',
-          DiscordUser: desiredDiscord,
-        },
-      },
-    ],
-    Subscriptions: [
-      {
-        Plan: {
-          Uid: process.env.OUTSETA_FREE_PLAN_UID,
-        },
-        BillingRenewalTerm: 1,
-      },
-    ],
-  };
-
-  const createResponse = await axios.post(
-    `${apiBase}/crm/registrations`,
-    createPayload,
-    {
-      headers: {
-        ...authHeader,
-        'Content-Type': 'application/json',
-      },
-      timeout: 8000,
-    }
-  );
-
-  return createResponse.data.PrimaryContact;
 }
 
 async function generateOutsetaToken(email) {
@@ -315,10 +295,147 @@ function renderErrorPage(message) {
 </html>`;
 }
 
+function renderRedirectWithError(returnUrl, code, message) {
+  const url = new URL(returnUrl);
+  const params = new URLSearchParams(url.hash?.replace(/^#/, '') || '');
+  params.set('error', code);
+  if (message) {
+    params.set('message', message);
+  }
+  url.hash = params.toString();
+
+  return `<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Redirecting...</title>
+  </head>
+  <body>
+    <script>
+      window.location.href = ${JSON.stringify(url.toString())};
+    </script>
+  </body>
+</html>`;
+}
+
+function renderLinkSuccessPage(returnUrl, provider) {
+  const url = new URL(returnUrl);
+  const params = new URLSearchParams(url.hash?.replace(/^#/, '') || '');
+  params.set('link', 'success');
+  params.set('provider', provider);
+  url.hash = params.toString();
+
+  return `<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Link Successful</title>
+  </head>
+  <body>
+    <script>
+      window.location.href = ${JSON.stringify(url.toString())};
+    </script>
+  </body>
+</html>`;
+}
+
 function getBaseUrl(req) {
   const protocol = req.headers['x-forwarded-proto'] || 'https';
   const host = req.headers['x-forwarded-host'] || req.headers.host;
   return `${protocol}://${host}`;
+}
+
+function getOutsetaApiBase() {
+  if (!process.env.OUTSETA_DOMAIN) {
+    throw new Error('OUTSETA_DOMAIN not configured');
+  }
+  return `https://${process.env.OUTSETA_DOMAIN}/api/v1`;
+}
+
+function getOutsetaAuthHeaders() {
+  if (!process.env.OUTSETA_API_KEY || !process.env.OUTSETA_SECRET_KEY) {
+    throw new Error('Outseta API credentials not configured');
+  }
+
+  return {
+    Authorization: `Outseta ${process.env.OUTSETA_API_KEY}:${process.env.OUTSETA_SECRET_KEY}`,
+    'Content-Type': 'application/json',
+  };
+}
+
+async function verifyOutsetaAccessToken(token) {
+  if (!token) {
+    throw new Error('Missing Outseta access token');
+  }
+
+  const apiBase = getOutsetaApiBase();
+
+  const response = await axios.get(`${apiBase}/profile`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+    timeout: 8000,
+  });
+
+  return response.data;
+}
+
+async function getPersonByUid(uid) {
+  if (!uid) return null;
+
+  const apiBase = getOutsetaApiBase();
+  const response = await axios.get(`${apiBase}/crm/people/${uid}`, {
+    headers: getOutsetaAuthHeaders(),
+    timeout: 8000,
+  });
+
+  return response.data;
+}
+
+async function findPersonByEmail(email) {
+  if (!email) return null;
+
+  const apiBase = getOutsetaApiBase();
+  const response = await axios.get(`${apiBase}/crm/people`, {
+    headers: getOutsetaAuthHeaders(),
+    params: { Email: email },
+    timeout: 8000,
+  });
+
+  return response.data.items?.[0] ?? null;
+}
+
+async function findPersonByField(field, value) {
+  if (!field || value == null) return null;
+
+  const apiBase = getOutsetaApiBase();
+  const response = await axios.get(`${apiBase}/crm/people`, {
+    headers: getOutsetaAuthHeaders(),
+    params: { [field]: value },
+    timeout: 8000,
+  });
+
+  return response.data.items?.[0] ?? null;
+}
+
+async function updatePerson(uid, payload) {
+  if (!uid) throw new Error('Cannot update person without UID');
+
+  const apiBase = getOutsetaApiBase();
+  await axios.put(`${apiBase}/crm/people/${uid}`, payload, {
+    headers: getOutsetaAuthHeaders(),
+    timeout: 8000,
+  });
+}
+
+async function createRegistration(payload) {
+  const apiBase = getOutsetaApiBase();
+  const response = await axios.post(`${apiBase}/crm/registrations`, payload, {
+    headers: getOutsetaAuthHeaders(),
+    timeout: 8000,
+  });
+
+  return response.data;
 }
 
 function dumpError(tag, error) {
@@ -359,4 +476,55 @@ function toJsonSafe(value) {
   } catch (err) {
     return String(value);
   }
+}
+
+function buildDiscordUpdatePayload(person, discordUser) {
+  const email = person.Email;
+  const displayName = discordUser.global_name || discordUser.username || person.FirstName || 'Discord User';
+  const nameParts = displayName.split(' ');
+  const firstName = person.FirstName || nameParts.shift() || 'Discord';
+  const lastName = person.LastName || nameParts.join(' ') || 'User';
+
+  return {
+    Uid: person.Uid,
+    Email: email,
+    FirstName: firstName,
+    LastName: lastName,
+    DiscordUsername: discordUser.username || displayName || '',
+    DiscordId: discordUser.id,
+  };
+}
+
+async function createDiscordOutsetaUser(discordUser) {
+  const email = (discordUser.email || `${discordUser.id}@discord.user`).toLowerCase();
+  const displayName = discordUser.global_name || discordUser.username || 'Discord User';
+  const nameParts = displayName.split(' ');
+  const firstName = nameParts.shift() || 'Discord';
+  const lastName = nameParts.join(' ') || 'User';
+
+  const registration = await createRegistration({
+    Name: `${firstName} ${lastName}`,
+    PersonAccount: [
+      {
+        IsPrimary: true,
+        Person: {
+          Email: email,
+          FirstName: firstName,
+          LastName: lastName,
+          DiscordUsername: discordUser.username || displayName || '',
+          DiscordId: discordUser.id,
+        },
+      },
+    ],
+    Subscriptions: [
+      {
+        Plan: {
+          Uid: process.env.OUTSETA_FREE_PLAN_UID,
+        },
+        BillingRenewalTerm: 1,
+      },
+    ],
+  });
+
+  return registration.PrimaryContact;
 }
