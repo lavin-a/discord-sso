@@ -1,15 +1,23 @@
 const axios = require('axios');
+const { kv } = require('@vercel/kv');
 
 const allowedOrigins = [
   'https://aware-amount-178968.framer.app',
   'https://almeidaracingacademy.com',
   'https://www.almeidaracingacademy.com',
-  'https://almeidaracingacademy.outseta.com',
 ];
+
+// Rate limiting: 10 requests per minute per IP
+async function checkRateLimit(ip) {
+  const key = `discord:ratelimit:${ip}`;
+  const count = await kv.incr(key);
+  if (count === 1) await kv.expire(key, 60);
+  return count <= 10;
+}
 
 module.exports = async (req, res) => {
   const origin = req.headers.origin;
-  if (allowedOrigins.includes(origin) || origin?.endsWith('.framer.app')) {
+  if (allowedOrigins.includes(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
   }
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -18,6 +26,12 @@ module.exports = async (req, res) => {
 
   if (req.method === 'OPTIONS') {
     return res.status(200).end();
+  }
+
+  // Rate limiting
+  const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.connection?.remoteAddress || 'unknown';
+  if (!await checkRateLimit(ip)) {
+    return res.status(429).json({ error: 'Too many requests. Please try again later.' });
   }
 
   const { code } = req.query;
@@ -29,7 +43,7 @@ module.exports = async (req, res) => {
   return handleCallback(req, res, code);
 };
 
-function handleStart(req, res) {
+async function handleStart(req, res) {
   if (!process.env.DISCORD_CLIENT_ID) {
     return res.status(500).send('Discord client ID not configured');
   }
@@ -42,11 +56,9 @@ function handleStart(req, res) {
 
   const redirectUri = `${getBaseUrl(req)}/api/auth/discord`;
 
-  // Store return URL in a simple map (in production, use Redis)
+  // Store return URL in Vercel KV with 10 minute expiration
   const state = require('crypto').randomBytes(16).toString('hex');
-  if (!global.discordStateStore) global.discordStateStore = new Map();
-  global.discordStateStore.set(state, { returnUrl, createdAt: Date.now() });
-  setTimeout(() => global.discordStateStore.delete(state), 10 * 60 * 1000);
+  await kv.set(`discord:state:${state}`, { returnUrl, createdAt: Date.now() }, { ex: 600 });
 
   const url =
     'https://discord.com/api/oauth2/authorize' +
@@ -69,8 +81,7 @@ async function handleCallback(req, res, code) {
 
   try {
     const state = req.query.state;
-    if (!global.discordStateStore) global.discordStateStore = new Map();
-    const stateData = global.discordStateStore.get(state);
+    const stateData = await kv.get(`discord:state:${state}`);
     const returnUrl = stateData?.returnUrl;
 
     if (!returnUrl) {
@@ -78,7 +89,7 @@ async function handleCallback(req, res, code) {
       return res.send(renderErrorPage('Session expired. Please try again.'));
     }
 
-    global.discordStateStore.delete(state);
+    await kv.del(`discord:state:${state}`);
 
     const redirectUri = `${getBaseUrl(req)}/api/auth/discord`;
 
