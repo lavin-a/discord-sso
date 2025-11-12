@@ -200,7 +200,7 @@ async function handleCallback(req, res, code) {
     if (existingByDiscordId) {
       if (intent === 'link') {
         if (!linkPersonUid || existingByDiscordId.Uid !== linkPersonUid) {
-          return res.send(renderRedirectWithError(returnUrl, 'account_exists', ACCOUNT_CONFLICT_MESSAGE));
+          return res.send(renderRedirectWithError(returnUrl, 'account_exists', ACCOUNT_CONFLICT_MESSAGE, 'discord'));
         }
 
         return res.send(renderLinkSuccessPage(returnUrl, 'discord'));
@@ -227,7 +227,7 @@ async function handleCallback(req, res, code) {
 
     const existingByEmail = await findPersonByEmail(email);
     if (existingByEmail) {
-      return res.send(renderRedirectWithError(returnUrl, 'account_exists', ACCOUNT_CONFLICT_MESSAGE));
+      return res.send(renderRedirectWithError(returnUrl, 'account_exists', ACCOUNT_CONFLICT_MESSAGE, 'discord'));
     }
 
     const createdPerson = await createDiscordOutsetaUser(discordUser);
@@ -298,12 +298,15 @@ function renderErrorPage(message) {
 </html>`;
 }
 
-function renderRedirectWithError(returnUrl, code, message) {
+function renderRedirectWithError(returnUrl, code, message, provider) {
   const url = new URL(returnUrl);
   const params = new URLSearchParams(url.hash?.replace(/^#/, '') || '');
   params.set('error', code);
   if (message) {
     params.set('message', message);
+  }
+  if (provider) {
+    params.set('provider', provider);
   }
   url.hash = params.toString();
 
