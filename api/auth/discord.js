@@ -233,6 +233,15 @@ async function handleCallback(req, res, code) {
 
     const existingByEmail = await findPersonByEmail(email);
     if (existingByEmail) {
+      const hasAccount = personHasAccount(existingByEmail);
+      if (!hasAccount) {
+        const ensured = await ensurePersonHasAccount(existingByEmail.Email, existingByEmail);
+        if (ensured) {
+          await updatePerson(existingByEmail.Uid, buildDiscordUpdatePayload(existingByEmail, discordUser));
+          const outsetaToken = await generateOutsetaToken(existingByEmail.Email);
+          return res.send(renderSuccessPage(outsetaToken, returnUrl));
+        }
+      }
       return res.send(renderRedirectWithError(returnUrl, 'account_exists', ACCOUNT_CONFLICT_MESSAGE, 'discord'));
     }
 
@@ -334,16 +343,26 @@ async function generateOutsetaToken(email) {
   const apiBase = `https://${process.env.OUTSETA_DOMAIN}/api/v1`;
   const authHeader = { Authorization: `Outseta ${process.env.OUTSETA_API_KEY}:${process.env.OUTSETA_SECRET_KEY}` };
 
-  const tokenResponse = await axios.post(
-    `${apiBase}/tokens`,
-    { username: email },
-    {
-      headers: { ...authHeader, 'Content-Type': 'application/json' },
-      timeout: 8000,
-    }
-  );
+  try {
+    const tokenResponse = await axios.post(
+      `${apiBase}/tokens`,
+      { username: email },
+      {
+        headers: { ...authHeader, 'Content-Type': 'application/json' },
+        timeout: 8000,
+      }
+    );
 
-  return tokenResponse.data.access_token || tokenResponse.data;
+    return tokenResponse.data.access_token || tokenResponse.data;
+  } catch (error) {
+    if (isInvalidGrantError(error)) {
+      const accountCreated = await ensurePersonHasAccount(email);
+      if (accountCreated) {
+        return generateOutsetaToken(email);
+      }
+    }
+    throw error;
+  }
 }
 
 function renderSuccessPage(token, returnUrl) {
@@ -494,7 +513,10 @@ async function findPersonByEmail(email) {
   const apiBase = getOutsetaApiBase();
   const response = await axios.get(`${apiBase}/crm/people`, {
     headers: getOutsetaAuthHeaders(),
-    params: { Email: email },
+    params: {
+      Email: email,
+      fields: 'Uid,Email,FirstName,LastName,PersonAccount.Account.Uid',
+    },
     timeout: 8000,
   });
 
@@ -666,4 +688,76 @@ function hasPassword(person) {
     if (person.HasPassword === true) return true;
 
   return false;
+}
+
+function isInvalidGrantError(error) {
+  const status = error?.response?.status;
+  const data = typeof error?.response?.data === 'string' ? error.response.data : '';
+  return status === 400 && data.toLowerCase().includes('invalid_grant');
+}
+
+async function ensurePersonHasAccount(email, existingPerson) {
+  try {
+    const person = existingPerson ?? (await findPersonByEmail(email));
+    if (!person || !person.Uid) {
+      return false;
+    }
+
+    const hasAccount = personHasAccount(person);
+    if (hasAccount) {
+      return false;
+    }
+
+    await createAccountForPerson(person);
+    return true;
+  } catch (error) {
+    console.warn('[DiscordSSO] ensurePersonHasAccount failed', error?.message || error);
+    return false;
+  }
+}
+
+async function createAccountForPerson(person) {
+  const apiBase = getOutsetaApiBase();
+  const freePlanUid = process.env.OUTSETA_FREE_PLAN_UID;
+  if (!freePlanUid) {
+    throw new Error('OUTSETA_FREE_PLAN_UID not configured');
+  }
+
+  const accountName = buildAccountName(person);
+
+  await axios.post(
+    `${apiBase}/crm/accounts`,
+    {
+      Name: accountName,
+      PersonAccount: [
+        {
+          IsPrimary: true,
+          Person: { Uid: person.Uid },
+        },
+      ],
+      Subscriptions: [
+        {
+          Plan: { Uid: freePlanUid },
+          BillingRenewalTerm: 1,
+        },
+      ],
+    },
+    {
+      headers: getOutsetaAuthHeaders(),
+      timeout: 8000,
+    }
+  );
+}
+
+function buildAccountName(person) {
+  const first = (person?.FirstName || '').trim();
+  const last = (person?.LastName || '').trim();
+  const email = person?.Email || 'Account';
+  const combined = `${first} ${last}`.trim();
+  return combined.length > 0 ? `${combined}'s Account` : `${email} Account`;
+}
+
+function personHasAccount(person) {
+  const memberships = Array.isArray(person?.PersonAccount) ? person.PersonAccount : [];
+  return memberships.some((membership) => membership?.Account?.Uid);
 }
