@@ -4,13 +4,11 @@ const { kv } = require('@vercel/kv');
 const allowedOrigins = [
   'https://almeidaracingacademy.com',
   'https://aware-amount-178968.framer.app',
-  'https://new.almeidaracingacademy.com',
 ];
 
 const allowedReturnUrls = [
   'https://almeidaracingacademy.com/success',
   'https://aware-amount-178968.framer.app/success',
-  'https://new.almeidaracingacademy.com/success',
 ];
 const DEFAULT_RETURN_URL = allowedReturnUrls[0];
 
@@ -20,7 +18,6 @@ const redirectHostAllowlist = new Set([
   ...allowedReturnUrls.map(getHost),
   'almeidaracingacademy.com',
   'aware-amount-178968.framer.app',
-  'new.almeidaracingacademy.com',
 ].filter(Boolean));
   
 function getHost(url) {
