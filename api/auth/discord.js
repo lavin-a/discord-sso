@@ -206,9 +206,11 @@ async function handleCallback(req, res, code) {
           return res.send(renderRedirectWithError(returnUrl, 'account_exists', ACCOUNT_CONFLICT_MESSAGE, 'discord'));
         }
 
+        await refreshDiscordProfile(existingByDiscordId, discordUser);
         return res.send(renderLinkSuccessPage(returnUrl, 'discord'));
       }
 
+      await refreshDiscordProfile(existingByDiscordId, discordUser);
       const outsetaToken = await generateOutsetaToken(existingByDiscordId.Email);
       return res.send(renderSuccessPage(outsetaToken, returnUrl));
     }
@@ -642,6 +644,16 @@ async function createDiscordOutsetaUser(discordUser) {
   });
 
   return registration.PrimaryContact;
+}
+
+async function refreshDiscordProfile(person, discordUser) {
+  if (!person?.Uid || !discordUser?.id) return;
+
+  try {
+    await updatePerson(person.Uid, buildDiscordUpdatePayload(person, discordUser));
+  } catch (error) {
+    console.warn('[DiscordSSO] refreshDiscordProfile failed', error?.message || error);
+  }
 }
 
 async function sendPasswordResetEmail(email) {
