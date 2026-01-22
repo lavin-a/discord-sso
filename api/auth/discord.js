@@ -1,6 +1,35 @@
 const axios = require('axios');
 const { kv } = require('@vercel/kv');
 
+/**
+ * Trigger immediate Discord role sync after linking Discord account.
+ * Fire-and-forget - doesn't block the auth flow.
+ */
+/**
+ * Trigger immediate Discord role sync after linking Discord account.
+ * Must be awaited in serverless environments to prevent premature termination.
+ */
+async function triggerRoleSync({ discordId, personUid }) {
+  if (!process.env.BOT_WEBHOOK_URL || !process.env.BOT_WEBHOOK_SECRET) return;
+
+  try {
+    await axios.post(`${process.env.BOT_WEBHOOK_URL}/api/sync-roles`, 
+      { discordId, personUid },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.BOT_WEBHOOK_SECRET}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 5000,
+      }
+    );
+    console.log(`[RoleSync] Triggered for discordId=${discordId}`);
+  } catch (err) {
+    // Log but don't fail the auth flow
+    console.warn('[RoleSync] Failed:', err.message);
+  }
+}
+
 const allowedOrigins = [
   'https://almeidaracingacademy.com',
   'https://aware-amount-178968.framer.app',
@@ -211,6 +240,10 @@ async function handleCallback(req, res, code) {
       }
 
       await refreshDiscordProfile(existingByDiscordId, discordUser);
+      
+      // Trigger immediate role sync
+      await triggerRoleSync({ discordId, personUid: existingByDiscordId.Uid });
+      
       const outsetaToken = await generateOutsetaToken(existingByDiscordId.Email);
       return res.send(renderSuccessPage(outsetaToken, returnUrl));
     }
@@ -227,6 +260,9 @@ async function handleCallback(req, res, code) {
 
       await updatePerson(linkPersonUid, buildDiscordUpdatePayload(person, discordUser));
 
+      // Trigger immediate role sync
+      await triggerRoleSync({ discordId, personUid: linkPersonUid });
+
       return res.send(renderLinkSuccessPage(returnUrl, 'discord'));
     }
 
@@ -237,6 +273,10 @@ async function handleCallback(req, res, code) {
         const ensured = await ensurePersonHasAccount(existingByEmail.Email, existingByEmail);
         if (ensured) {
           await updatePerson(existingByEmail.Uid, buildDiscordUpdatePayload(existingByEmail, discordUser));
+          
+          // Trigger immediate role sync
+          await triggerRoleSync({ discordId, personUid: existingByEmail.Uid });
+          
           const outsetaToken = await generateOutsetaToken(existingByEmail.Email);
           return res.send(renderSuccessPage(outsetaToken, returnUrl));
         }
@@ -245,6 +285,10 @@ async function handleCallback(req, res, code) {
     }
 
     const createdPerson = await createDiscordOutsetaUser(discordUser);
+    
+    // Trigger immediate role sync
+    await triggerRoleSync({ discordId, personUid: createdPerson.Uid });
+    
     const outsetaToken = await generateOutsetaToken(createdPerson.Email);
 
     return res.send(renderSuccessPage(outsetaToken, returnUrl));
