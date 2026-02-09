@@ -160,6 +160,12 @@ async function handleStart(req, res) {
 
   // Store return URL in Vercel KV with 10 minute expiration
   const state = require('crypto').randomBytes(16).toString('hex');
+  console.log('[DiscordSSO] storing OAuth state', {
+    key: `discord:state:${state}`,
+    intent,
+    hasReturnUrl: Boolean(returnUrl),
+    createdAt: Date.now(),
+  });
   await kv.set(
     `discord:state:${state}`,
     { returnUrl, intent, linkPersonUid, createdAt: Date.now() },
@@ -187,17 +193,30 @@ async function handleCallback(req, res, code) {
 
   try {
     const state = req.query.state;
-    const stateData = await kv.get(`discord:state:${state}`);
+    console.log('[DiscordSSO] received OAuth state', { state });
+    const stateKey = `discord:state:${state}`;
+    const usedKey = `discord:state:used:${state}`;
+    const stateData = await kv.get(stateKey);
     const returnUrl = stateData?.returnUrl;
     const intent = stateData?.intent || 'login';
     const linkPersonUid = stateData?.linkPersonUid || null;
 
     if (!returnUrl) {
-      console.error('State not found for Discord OAuth');
+      const usedData = await kv.get(usedKey);
+      if (usedData?.returnUrl) {
+        if (usedData.mode === 'link') {
+          return res.send(renderLinkSuccessPage(usedData.returnUrl, 'discord'));
+        }
+        return res.send(renderSuccessPage(usedData.outsetaToken || '', usedData.returnUrl));
+      }
+      console.error('State not found for Discord OAuth', { state });
       return res.send(renderErrorPage('Session expired. Please try again.'));
     }
 
-    await kv.del(`discord:state:${state}`);
+    const finalizeSuccess = async (mode, token) => {
+      await kv.set(usedKey, { returnUrl, outsetaToken: token || '', mode }, { ex: 300 });
+      await kv.del(stateKey);
+    };
 
     const redirectUri = `${getBaseUrl(req)}/api/auth/discord`;
 
@@ -236,6 +255,7 @@ async function handleCallback(req, res, code) {
         }
 
         await refreshDiscordProfile(existingByDiscordId, discordUser);
+        await finalizeSuccess('link');
         return res.send(renderLinkSuccessPage(returnUrl, 'discord'));
       }
 
@@ -245,6 +265,7 @@ async function handleCallback(req, res, code) {
       await triggerRoleSync({ discordId, personUid: existingByDiscordId.Uid });
       
       const outsetaToken = await generateOutsetaToken(existingByDiscordId.Email);
+      await finalizeSuccess('login', outsetaToken);
       return res.send(renderSuccessPage(outsetaToken, returnUrl));
     }
 
@@ -263,6 +284,7 @@ async function handleCallback(req, res, code) {
       // Trigger immediate role sync
       await triggerRoleSync({ discordId, personUid: linkPersonUid });
 
+      await finalizeSuccess('link');
       return res.send(renderLinkSuccessPage(returnUrl, 'discord'));
     }
 
@@ -278,6 +300,7 @@ async function handleCallback(req, res, code) {
           await triggerRoleSync({ discordId, personUid: existingByEmail.Uid });
           
           const outsetaToken = await generateOutsetaToken(existingByEmail.Email);
+          await finalizeSuccess('login', outsetaToken);
           return res.send(renderSuccessPage(outsetaToken, returnUrl));
         }
       }
@@ -291,6 +314,7 @@ async function handleCallback(req, res, code) {
     
     const outsetaToken = await generateOutsetaToken(createdPerson.Email);
 
+    await finalizeSuccess('login', outsetaToken);
     return res.send(renderSuccessPage(outsetaToken, returnUrl));
   } catch (err) {
     dumpError('[DiscordSSO]', err);
@@ -347,6 +371,11 @@ async function handleDisconnect(req, res) {
     });
   } catch (err) {
     dumpError('[DiscordSSO][disconnect]', err);
+
+    if (err.status === 401 || err.response?.status === 401) {
+      return res.status(401).json({ error: 'Session expired. Please try again.', code: 'TOKEN_EXPIRED' });
+    }
+
     return res.status(500).json({ error: 'Unable to disconnect Discord at this time.' });
   }
 }
@@ -378,6 +407,11 @@ async function handleSendPasswordReset(req, res) {
     return res.status(200).json({ success: true });
   } catch (err) {
     dumpError('[DiscordSSO][password-reset]', err);
+
+    if (err.status === 401 || err.response?.status === 401) {
+      return res.status(401).json({ error: 'Session expired. Please try again.', code: 'TOKEN_EXPIRED' });
+    }
+
     return res.status(500).json({ error: 'Unable to send password email. Please try again later.' });
   }
 }
@@ -573,7 +607,7 @@ async function findPersonByField(field, value) {
   const response = await axios.get(`${apiBase}/crm/people`, {
     headers: getOutsetaAuthHeaders(),
     params: { [field]: value },
-    timeout: 8000,
+    timeout: 12000,
   });
 
   return response.data.items?.[0] ?? null;
