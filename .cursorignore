@@ -1,0 +1,19 @@
+# Secrets - agent must not read these
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Vercel local state
+.vercel/
+
+# SSH / PEM keys
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Common credential files
+credentials.json
+secrets.json
+*.secrets
