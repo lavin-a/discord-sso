@@ -263,17 +263,30 @@ async function handleCallback(req, res, code) {
 
     const redirectUri = `${getBaseUrl(req)}/api/auth/discord`;
 
-    const tokenResponse = await httpRequest('POST', 'https://discord.com/api/oauth2/token', {
-      data: new URLSearchParams({
-        grant_type: 'authorization_code',
-        code,
-        client_id: process.env.DISCORD_CLIENT_ID,
-        client_secret: process.env.DISCORD_CLIENT_SECRET,
-        redirect_uri: redirectUri,
-      }),
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      timeout: 8000,
-    });
+    let tokenResponse;
+    try {
+      tokenResponse = await httpRequest('POST', 'https://discord.com/api/oauth2/token', {
+        data: new URLSearchParams({
+          grant_type: 'authorization_code',
+          code,
+          client_id: process.env.DISCORD_CLIENT_ID,
+          client_secret: process.env.DISCORD_CLIENT_SECRET,
+          redirect_uri: redirectUri,
+        }),
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        timeout: 8000,
+      });
+    } catch (err) {
+      // Discord OAuth codes are single-use. If a user refreshes/retries the
+      // callback URL after a mid-flow failure, Discord rejects the already-
+      // consumed code with invalid_grant. Show a clear "restart login"
+      // message instead of the generic error page.
+      if (isInvalidGrantError(err)) {
+        console.warn('[DiscordSSO] invalid_grant on code exchange (likely retry of already-used code)');
+        return res.send(renderErrorPage('Your sign-in link expired. Please sign in again.'));
+      }
+      throw err;
+    }
 
     const discordAccessToken = tokenResponse.data.access_token;
 
@@ -460,13 +473,31 @@ async function generateOutsetaToken(email) {
   const apiBase = `https://${process.env.OUTSETA_DOMAIN}/api/v1`;
   const authHeader = { Authorization: `Outseta ${process.env.OUTSETA_API_KEY}:${process.env.OUTSETA_SECRET_KEY}` };
 
-  try {
-    const tokenResponse = await httpRequest('POST', `${apiBase}/tokens`, {
+  // Outseta's /tokens endpoint occasionally takes >8s; we've seen it hit the
+  // client timeout and block real logins. Give it 15s and one retry on
+  // abort/5xx before surfacing an error to the user.
+  const call = () =>
+    httpRequest('POST', `${apiBase}/tokens`, {
       data: { username: email },
       headers: { ...authHeader, 'Content-Type': 'application/json' },
-      timeout: 8000,
+      timeout: 15000,
     });
 
+  const isRetryable = (err) => {
+    if (err?.name === 'AbortError') return true;
+    const s = err?.status || err?.response?.status;
+    return typeof s === 'number' && s >= 500 && s < 600;
+  };
+
+  try {
+    let tokenResponse;
+    try {
+      tokenResponse = await call();
+    } catch (err) {
+      if (!isRetryable(err)) throw err;
+      console.warn('[DiscordSSO] Outseta /tokens retry', { reason: err?.name || err?.message });
+      tokenResponse = await call();
+    }
     return tokenResponse.data.access_token || tokenResponse.data;
   } catch (error) {
     if (isInvalidGrantError(error)) {
@@ -812,8 +843,14 @@ function hasPassword(person) {
 
 function isInvalidGrantError(error) {
   const status = error?.response?.status;
-  const data = typeof error?.response?.data === 'string' ? error.response.data : '';
-  return status === 400 && data.toLowerCase().includes('invalid_grant');
+  if (status !== 400) return false;
+  const data = error?.response?.data;
+  if (typeof data === 'string') return data.toLowerCase().includes('invalid_grant');
+  if (data && typeof data === 'object') {
+    const err = typeof data.error === 'string' ? data.error.toLowerCase() : '';
+    return err === 'invalid_grant';
+  }
+  return false;
 }
 
 async function ensurePersonHasAccount(email, existingPerson) {
