@@ -48,17 +48,16 @@ const kv = new Redis({
 
 /**
  * Trigger immediate Discord role sync after linking Discord account.
- * Fire-and-forget - doesn't block the auth flow.
- */
-/**
- * Trigger immediate Discord role sync after linking Discord account.
  * Must be awaited in serverless environments to prevent premature termination.
+ * The bot returns 200 for both successful syncs and benign no-ops (user not in
+ * guild, Outseta read-after-write race, etc.) — `body.success` carries the real
+ * outcome. 4xx/5xx here indicates an actual transport or server error.
  */
 async function triggerRoleSync({ discordId, personUid }) {
   if (!process.env.BOT_WEBHOOK_URL || !process.env.BOT_WEBHOOK_SECRET) return;
 
   try {
-    await httpRequest('POST', `${process.env.BOT_WEBHOOK_URL}/api/sync-roles`, {
+    const resp = await httpRequest('POST', `${process.env.BOT_WEBHOOK_URL}/api/sync-roles`, {
       data: { discordId, personUid },
       headers: {
         Authorization: `Bearer ${process.env.BOT_WEBHOOK_SECRET}`,
@@ -66,7 +65,12 @@ async function triggerRoleSync({ discordId, personUid }) {
       },
       timeout: 5000,
     });
-    console.log(`[RoleSync] Triggered for discordId=${discordId}`);
+    const body = resp?.data;
+    if (body?.success) {
+      console.log(`[RoleSync] synced discordId=${discordId} added=${body.added ?? 0} removed=${body.removed ?? 0}`);
+    } else {
+      console.info(`[RoleSync] no-op for discordId=${discordId}: ${body?.error || 'unknown'}`);
+    }
   } catch (err) {
     // Log but don't fail the auth flow
     console.warn('[RoleSync] Failed:', err.message);
