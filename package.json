@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "Discord SSO + Outseta backend for Vercel",
   "dependencies": {
-    "@upstash/redis": "^1.36.0"
+    "@upstash/redis": "1.39.0"
+  },
+  "engines": {
+    "node": ">=24.22.1 <25"
   }
 }
